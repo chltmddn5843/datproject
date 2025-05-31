@@ -14,9 +14,10 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 let resultList = [];
-let qnaItems = []; // 모든 QNA 항목 저장
+let qnaItems = [];
+let currentKeyword = ''; // 현재 검색 키워드 저장
 
-// 루트 경로에 키워드 입력 폼 제공
+// 루트 경로: 키워드 입력 폼
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -37,16 +38,18 @@ app.get('/', (req, res) => {
 });
 
 // 유사도 계산 함수
-function calculateSimilarity(keyword, qnaTitl, ansCntnCl) {
+function calculateSimilarity(keyword, text1, text2 = '') {
   const tfidf = new TfIdf();
   tfidf.addDocument(keyword);
-  tfidf.addDocument(qnaTitl + ' ' + ansCntnCl);
-  let sim = 0;
-  tfidf.tfidfs(keyword, 0, (i, measure) => { if (i === 1) sim = measure; });
-  return sim;
+  tfidf.addDocument(`${text1} ${text2}`);
+  let similarity = 0;
+  tfidf.tfidfs(keyword, 0, (i, measure) => {
+    if (i === 1) similarity = measure;
+  });
+  return similarity;
 }
 
-// PolicyQnaList API 호출 및 resultList 저장
+// 1차: PolicyQnaList API 호출 및 제목 기준 유사도 상위 3개만 저장
 app.get('/policyQnaList', async (req, res) => {
   const {
     firstIndex = 1,
@@ -57,6 +60,8 @@ app.get('/policyQnaList', async (req, res) => {
     regFrom = '20220101',
     regTo = '20250529'
   } = req.query;
+
+  currentKeyword = keyword;
 
   try {
     const queryParams = new URLSearchParams({
@@ -71,8 +76,19 @@ app.get('/policyQnaList', async (req, res) => {
     });
 
     const response = await axios.get(POLICY_QNA_URL, { params: queryParams });
-    resultList = response.data.resultList || [];
-    res.json(response.data);
+    const originList = response.data.resultList || [];
+
+    // 제목 기준 유사도 계산 및 상위 3개만 추출
+    const filteredList = originList
+      .map(item => ({
+        ...item,
+        similarity: calculateSimilarity(keyword, item.qnaTitl)
+      }))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, 3);
+
+    resultList = filteredList;
+    res.json({ ...response.data, resultList: filteredList });
   } catch (error) {
     if (error.response) {
       res.status(error.response.status).json({
@@ -85,67 +101,60 @@ app.get('/policyQnaList', async (req, res) => {
   }
 });
 
-// [수정] 모든 QNA 항목 반환 (유사도 계산 X)
+// 2차: 각 항목 상세조회 및 제목+내용 기준 유사도 계산
 app.get('/callPolicyQnaItem', async (req, res) => {
-  try {
-    if (!resultList || resultList.length === 0) {
-      return res.status(400).json({ error: "resultList가 비어있습니다. 먼저 /policyQnaList를 호출하세요." });
-    }
+  if (!resultList || resultList.length === 0) {
+    return res.status(400).json({ error: "resultList가 비어있습니다. 먼저 /policyQnaList를 호출하세요." });
+  }
 
-    const itemPromises = resultList.map(item => {
+  try {
+    const itemPromises = resultList.map(async item => {
       const queryParams = new URLSearchParams({
         serviceKey: SERVICE_KEY,
         faqNo: item.faqNo,
         dutySctnNm: item.dutySctnNm
       });
 
-      return axios.get(POLICY_QNA_ITEM_URL, { params: queryParams })
-        .then(response => ({
-          faqNo: item.faqNo,
-          dutySctnNm: item.dutySctnNm,
-          result: response.data.resultData
-        }))
-        .catch(error => ({
-          faqNo: item.faqNo,
-          dutySctnNm: item.dutySctnNm,
+      try {
+        const response = await axios.get(POLICY_QNA_ITEM_URL, { params: queryParams });
+        const detail = response.data.resultData;
+        return {
+          ...item,
+          result: detail,
+          similarity: calculateSimilarity(
+            currentKeyword,
+            detail.qnaTitl,
+            detail.ansCntnCl
+          )
+        };
+      } catch (error) {
+        return {
+          ...item,
+          result: null,
+          similarity: 0,
           error: error.message
-        }));
+        };
+      }
     });
 
-    qnaItems = await Promise.all(itemPromises);
+    // 상세내역 유사도 기준 내림차순 정렬
+    qnaItems = (await Promise.all(itemPromises))
+      .sort((a, b) => b.similarity - a.similarity);
+
     res.json(qnaItems);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// [수정] 최종 결과만 반환 (유사도 계산 O)
+// 최종: 유사도 가장 높은 상세내역 1개 반환
 app.get('/getFinalResult', (req, res) => {
-  const keyword = req.query.keyword;
-  if (!keyword) {
-    return res.status(400).json({ error: "keyword 파라미터가 필요합니다." });
-  }
-
   if (!qnaItems || qnaItems.length === 0) {
     return res.status(400).json({ error: "QNA 항목이 없습니다. 먼저 /callPolicyQnaItem을 호출하세요." });
   }
 
-  // 유사도 계산
-  const itemsWithSimilarity = qnaItems.map(item => ({
-    ...item,
-    similarity: calculateSimilarity(
-      keyword,
-      item.result.qnaTitl,
-      item.result.ansCntnCl
-    )
-  }));
-
-  // 최대 유사도 항목 선택
-  const final_result = itemsWithSimilarity.reduce((max, item) => 
-    item.similarity > max.similarity ? item : max
-  );
-
-  res.json({ final_result });
+  const finalResult = qnaItems[0]; // 이미 유사도 내림차순 정렬됨
+  res.json({ final_result: finalResult });
 });
 
 const PORT = process.env.PORT || 3000;
