@@ -1,21 +1,35 @@
 const express = require('express');
 const axios = require('axios');
-const natural = require('natural');
-const { TfIdf } = natural;
 const path = require('path');
 const app = express();
+const { TfIdf } = require('natural');
+const { initialize, Sentence, Tagger } = require('koalanlp/Node'); // KoalaNLP Node.js 모듈
+
+// npm install koalanlp@4.3.2 natural 
+
 require('dotenv').config();
 
 const POLICY_QNA_URL = 'http://apis.data.go.kr/1140100/CivilPolicyQnaService/PolicyQnaList';
 const POLICY_QNA_ITEM_URL = 'http://apis.data.go.kr/1140100/CivilPolicyQnaService/PolicyQnaItem';
 const SERVICE_KEY = process.env.SERVICE_KEY || '/1iwjHt7iRohlMbB6FpiKFkh2dbCo7vvF1Kv742QkTXXjDyz877Y1NZnhjV6gvTeCNV78Jz0i1SvOSLke8JLlw==';
 
+// KoalaNLP 초기화 (반드시 최상단에서 실행)
+initialize({
+  packages: ['KMR', 'KKMA'], // 형태소 분석기 2개 로드
+  verbose: true,
+  javaOptions: ['-Xmx4g'] // 메모리 설정
+}).then(() => {
+  console.log('KoalaNLP 초기화 완료');
+}).catch(err => {
+  console.error('KoalaNLP 초기화 실패:', err);
+});
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 let resultList = [];
 let qnaItems = [];
-let currentKeyword = ''; // 현재 검색 키워드 저장
+let currentKeyword = '';
 
 // 루트 경로: 키워드 입력 폼
 app.get('/', (req, res) => {
@@ -37,13 +51,29 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 유사도 계산 함수
-function calculateSimilarity(keyword, text1, text2 = '') {
+// 한국어 전처리 함수 (KoalaNLP 사용)
+async function preprocess(text) {
+  const sentence = new Sentence(text);
+  const tagger = new Tagger('KKMA'); // KKMA 형태소 분석기 사용
+  await tagger.tag(sentence);
+  return sentence.getTokens()
+    .filter(token => 
+      ['NNG', 'NNP', 'VV', 'VA'].includes(token.getPos().toString()) // 명사/동사/형용사 추출
+    )
+    .map(token => token.getSurface());
+}
+
+// TF-IDF 유사도 계산 함수 (KoalaNLP 최적화, async로 변경)
+async function calculateSimilarity(keyword, text1, text2 = '') {
+  const processedKeyword = await preprocess(keyword);
+  const processedText = await preprocess(`${text1} ${text2}`);
+  
   const tfidf = new TfIdf();
-  tfidf.addDocument(keyword);
-  tfidf.addDocument(`${text1} ${text2}`);
+  tfidf.addDocument(processedKeyword.join(' '));
+  tfidf.addDocument(processedText.join(' '));
+  
   let similarity = 0;
-  tfidf.tfidfs(keyword, 0, (i, measure) => {
+  tfidf.tfidfs(processedKeyword.join(' '), 0, (i, measure) => {
     if (i === 1) similarity = measure;
   });
   return similarity;
@@ -55,7 +85,7 @@ app.get('/policyQnaList', async (req, res) => {
     firstIndex = 1,
     recordCountPerPage = 10,
     type = 1,
-    keyword = '국세청',
+    keyword = '',
     searchType = 1,
     regFrom = '20220101',
     regTo = '20250529'
@@ -79,16 +109,17 @@ app.get('/policyQnaList', async (req, res) => {
     const originList = response.data.resultList || [];
 
     // 제목 기준 유사도 계산 및 상위 3개만 추출
-    const filteredList = originList
-      .map(item => ({
+    const filteredList = await Promise.all(
+      originList.map(async item => ({
         ...item,
-        similarity: calculateSimilarity(keyword, item.qnaTitl)
+        similarity: await calculateSimilarity(keyword, item.qnaTitl)
       }))
+    );
+    resultList = filteredList
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, 3);
 
-    resultList = filteredList;
-    res.json({ ...response.data, resultList: filteredList });
+    res.json({ ...response.data, resultList });
   } catch (error) {
     if (error.response) {
       res.status(error.response.status).json({
@@ -121,7 +152,7 @@ app.get('/callPolicyQnaItem', async (req, res) => {
         return {
           ...item,
           result: detail,
-          similarity: calculateSimilarity(
+          similarity: await calculateSimilarity(
             currentKeyword,
             detail.qnaTitl,
             detail.ansCntnCl
